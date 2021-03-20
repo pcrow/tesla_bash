@@ -1,0 +1,1849 @@
+#!/bin/bash
+#
+# Talk to the Tesla servers to get car status
+#
+# API details:
+# https://tesla-api.timdorr.com/
+# https://www.teslaapi.io/vehicles/commands
+#
+
+AGENT="Preston Crow's Bash Tesla API 0.2"
+TMPDIR=/tmp
+DEBUGDIR=/tmp
+TMP_FILE=${TMPDIR}/teslatmp.html
+CONFIG_FILE=~/.teslarc
+COOKIES=~/.cookies
+
+# https://pastebin.com/pS7Z6yyP
+_TESLA_CLIENT_ID=81527cff06843c8634fdc09e8ac0abefb46ac849f38fe1e431c2ef2106796384
+_TESLA_CLIENT_SECRET=c7257eb71a564034f9419ee651c7d0e5f7aa6bfbd18bafb5c5c033b093bb2fa3
+
+# ANSI color code defines
+. ~/bin/bash_library
+
+[ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}"
+
+#
+# percent_encode()
+#
+# Encode the stream with percent hex codes for special characters
+#
+# If $1 is "limited" then don't encode '=' or '&'.
+# If $1 is "url" then don't encode [:/?=&], but do [!$*()].
+#
+# In no case do we encode '%', so it is safe to pass through this multiple times.
+#
+percent_encode()
+{
+    if [ "$1" == "limited" ]; then
+	sed -e 'sX"X%22Xg' -e 'sX/X%2FXg' -e 'sX}X%7DXg' -e 'sX{X%7BXg' -e 'sX;X%3BXg' -e 'sX,X%2CXg' -e 'sX?X%3FXg' -e 'sX<X%3CXg' -e 'sX>X%3EXg' -e 'sX X%20Xg' -e 'sX:X%3AXg' -e 'sX|X%7CXg'
+    elif [ "$1" == "url" ]; then
+	sed -e 'sX"X%22Xg' -e 'sX}X%7DXg' -e 'sX{X%7BXg' -e 'sX;X%3BXg' -e 'sX,X%2CXg' -e 'sX<X%3CXg' -e 'sX>X%3EXg' -e 'sX X%20Xg' -e 'sX|X%7CXg' -e 'sX[$]X%24Xg' -e 'sX[!]X%21Xg' -e 'sX[*]X%2AXg' -e 'sX(X%28Xg' -e 'sX)X%29Xg'
+    else
+	sed -e 'sX"X%22Xg' -e 'sX/X%2FXg' -e 'sX}X%7DXg' -e 'sX{X%7BXg' -e 'sX;X%3BXg' -e 'sX,X%2CXg' -e 'sX?X%3FXg' -e 'sX<X%3CXg' -e 'sX>X%3EXg' -e 'sX X%20Xg' -e 'sX:X%3AXg' -e 'sX=X%3DXg' -e 'sX&X%26Xg' -e 'sX|X%7CXg'
+    fi
+}
+
+#
+# tesla_save_state()
+#
+tesla_save_state()
+{
+    declare -p | grep '^declare [^ ]* TESLA_' > "${CONFIG_FILE}"
+}
+
+#
+# post_clean()
+#
+# Clean up scriptified html
+#
+post_clean()
+{
+    # tee ${DEBUGDIR}/debug.clean |
+    sed -e 'sX\\u003cX\x3cXg' -e 'sX\\u0025X\x25Xg' -e 'sX\\u0040X\x40Xg' -e 'sX\\u00b7X\xb7Xg' -e 'sX\\u00e9X\xe9Xg' -e 'sX\\nX\nXg' -e 'sX\\rXXg' -e 'sX\\tX\tXg' -e 'sX\\XXg' | strings
+}
+
+#
+# load_page()
+#
+# $1 -- URL
+# $2 -- file for results
+# $3... -- extra headers
+#
+load_page()
+{
+    local PARMS URL FILE
+
+    URL="$1"
+    shift
+    FILE="$1"
+    shift
+    unset http_proxy
+    PARMS=()
+    while [ -n "$1" ]; do
+	case "$1" in
+	    -* )
+		PARMS+=( "$1")
+		;;
+	    *)
+		PARMS+=( -H "$1" )
+		;;
+	esac
+	shift
+    done
+    
+    # If using Cookies:
+    #  local C="~/.cookies.txt"
+    #  curl ... --cookie ${C} --cookie-jar ${C}
+    HTTP_CODE=$(timeout 3m curl --silent --location --compressed --cookie ${COOKIES} --cookie-jar ${COOKIES} --user-agent "${AGENT}" "${PARMS[@]}" "${URL}" --write-out "%{http_code}\n" --output "${FILE}")
+    return $?
+}
+
+#
+# post_page()
+#
+# Load a page, and reload on failure
+#
+# Parameters:
+#  $1 -- URL to load
+#  $2 -- file for results
+#  $3 -- post data
+#  $4... -- extra headers
+#
+# Globals:
+#   AGENT
+#   HTTP_CODE
+#
+# Return:
+#   non-zero indicates failure
+#
+post_page()
+{
+    local FAIL=0
+    local POST_DATA="$3"
+    local FILE="$2"
+    local URL="$1"
+    local PARMS
+    shift
+    shift
+    shift
+
+    PARMS=()
+    while [ -n "$1" ]; do
+	case "$1" in
+	    -* )
+		PARMS+=( "$1")
+		;;
+	    *)
+		PARMS+=( -H "$1" )
+		;;
+	esac
+	shift
+    done
+
+    HTTP_CODE=$(timeout 3m curl --request POST --silent --compressed --cookie ${COOKIES} --cookie-jar ${COOKIES} --user-agent "${AGENT}" --data-ascii "${POST_DATA}" "${PARMS[@]}" "${URL}" --output >( post_clean > "${FILE}" ) --write-out "%{http_code}\n")
+    if grep -q 'Error loading page' "${FILE}"; then
+	echo "$(date) ${FUNCNAME[0]}: ${ANSI_COLOR_RED}posting failed${ANSI_COLOR_DEFAULT}: ${URL}"
+	return 1
+    fi
+    return 0
+}
+
+#
+# results_to_vars()
+#
+# pipe in the results of a standard JSON reques, and convert to
+# global BASH variables
+#
+# $1 - variable prefix (optional)
+#
+results_to_vars()
+{
+    local PREFIX="$1"
+    eval $(sed -e 's/^{//' -e 's/}$//' -e 's/,/\n/g' -e 's/":/=/g' | sed -e s/^\"/"${PREFIX}"/)
+}
+
+#
+# tesla_token_valid()
+#
+# Return success if AUTH_access_token is defined and not expired
+#
+tesla_token_valid()
+{
+    [ -z "${AUTH_access_token}" ] && return 1
+    [ -z "${AUTH_created_at}" ] && return 1
+    [ -z "${AUTH_expires_in}" ] && return 1
+    if [ $( date +%s ) -lt $(( AUTH_created_at + AUTH_expires_in )) ]; then
+	if [ $( date +%s -d "now + 24 hours" ) -gt $(( AUTH_created_at + AUTH_expires_in )) ]; then
+	    false
+	    ### FIXME ### Renew the token
+	fi
+	return 0
+    fi
+    return 1
+}
+
+
+#
+# tesla_login()
+#
+# $1 -- email address
+# $2 -- password
+#
+# OLD OBSOLETE METHOD -- NO LONGER WORKS
+#
+tesla_login()
+{
+    tesla_token_valid && return 0
+
+    local PW YN
+
+    if [ -z "${TESLA_email}" ]; then
+	echo -n "Enter Tesla account email address: "
+	read TESLA_email
+    fi
+    PW="${TESLA_password}"
+    if [ -z "${PW}" ]; then
+	echo -n "Enter Tesla account password: "
+	read PW
+	echo -n "Save password in "${CONFIG_FILE}"? (y/n) "
+	read YN
+	if [ "${YN::1}" == 'y' -o  "${YN::1}" == 'Y' ]; then
+	    TESLA_password="${PW}"
+	fi
+    fi
+
+    local POST_DATA="grant_type=password&client_id=${_TESLA_CLIENT_ID}&client_secret=${_TESLA_CLIENT_SECRET}&email=${TESLA_email}&password=${PW}"
+    local POST_URL="https://owner-api.teslamotors.com/oauth/token"
+
+    if ! post_page "${POST_URL}" "${TMP_FILE}" "${POST_DATA}"; then
+	return 1
+    fi
+    results_to_vars "AUTH_" < "${TMP_FILE}"
+    # echo token: ${AUTH_access_token}
+    tesla_save_state
+    return 0
+}
+
+#
+# tesla_login()
+#
+# $1 -- email address
+# $2 -- password
+#
+# Based on:
+#   https://tesla-api.timdorr.com/api-basics/authentication
+#
+tesla_login()
+{
+    tesla_token_valid && return 0
+
+    local PW YN
+
+    if [ -z "${TESLA_email}" ]; then
+	echo -n "Enter Tesla account email address: "
+	read TESLA_email
+    fi
+    PW="${TESLA_password}"
+    if [ -z "${PW}" ]; then
+	echo -n "Enter Tesla account password: "
+	read PW
+	echo -n "Save password in "${CONFIG_FILE}"? (y/n) "
+	read YN
+	if [ "${YN::1}" == 'y' -o  "${YN::1}" == 'Y' ]; then
+	    TESLA_password="${PW}"
+	fi
+    fi
+
+    local URL POST_DATA STATUS CODE
+
+    #
+    # Step 1: Obtain the login page
+    #
+    TESLA_code_verifier=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 86)
+    TESLA_code_challenge=$(echo ${TESLA_code_verifier} | sha256sum | base64 --wrap=0)
+    TESLA_oath_state=$(tr -dc A-F0-9 </dev/urandom | head -c 32 ; echo '')
+    URL="client_id=ownerapi"
+    # URL+="?client_id=teslaweb" # works
+    URL+="&code_challenge=${TESLA_code_challenge}"
+    URL+="&code_challenge_method=S256"
+    URL+="&redirect_uri=https://auth.tesla.com/void/callback" # Works with 'ownerapi'
+    # URL+="&redirect_uri=https://www.tesla.com/openid-connect/generic" # Works with 'teslawab'
+    URL+="&response_type=code"
+    URL+="&scope=openid email offline_access"
+    URL+="&state=${TESLA_oath_state}"
+    URL="$(echo "${URL}" | percent_encode limited | sed -e 's/%20/+/g' )"
+    URL="https://auth.tesla.com/oauth2/v3/authorize?${URL}"
+#echo "${URL}"
+    load_page "${URL}" ${TMP_FILE}
+    STATUS=$?
+    if [ ${STATUS} != 0 -o ${HTTP_CODE} != 200 ]; then
+	return 1
+    fi
+#echo "load page: HTTP code ${HTTP_CODE}, status ${STATUS}"
+
+    #
+    # Step 2: Obtain an authorization code
+    #
+    POST_DATA="$(cat ${TMP_FILE} | sed -e '1,/<form/d' -e '/<.form/,$d' | grep input | grep hidden | sed -e 's/.*name="\([^"]*\)".*value="\([^"]*\)".*/\1=\2/' | tr '\n' '&')"
+    POST_DATA+="identity=${TESLA_email}&"
+    POST_DATA+="credential=${PW}"
+#echo "POST data: ${POST_DATA}"
+    post_page "${URL}" "${TMP_FILE}" "${POST_DATA}"
+    STATUS=$?
+    CODE=$(cat ${TMP_FILE} | grep '[?&]code=' | sed -e 's/.*[&?]code=//' -e 's/&.*//')
+    if [ ${STATUS} != 0 -o ${HTTP_CODE} != 302 -o -z "${CODE}" ]; then
+	return 1
+    fi
+#echo "post page: HTTP code ${HTTP_CODE}, status ${STATUS}, CODE ${CODE}"
+
+    #
+    # Step 3: Exchange authroization code for bearer token
+    #
+    POST_DATA='{"grant_type":"authorization_code","client_id":"ownerapi","code":"'${CODE}'","code_verifier":"'${TESLA_code_verifier}'","redirect_uri":"https://auth.tesla.com/void/callback"}'
+    post_page "https://auth.tesla.com/oauth2/v3/token" "${TMP_FILE}" "${POST_DATA}" "Content-Type:application/json" "Accept: application/json"
+    STATUS=$?
+    results_to_vars "AUTH_" < "${TMP_FILE}"
+    if [ ${STATUS} != 0 -o ${HTTP_CODE} != 200 -o -z "${AUTH_access_token}" ]; then
+	return 1
+    fi
+#echo "post page: HTTP code ${HTTP_CODE}, status ${STATUS}, token ${AUTH_access_token}"
+
+    #
+    # Step 4: Exchange bearer token for access token
+    #
+    POST_DATA='{"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer","client_id": "'${_TESLA_CLIENT_ID}'","client_secret": "'${_TESLA_CLIENT_SECRET}'"}'
+    post_page "https://owner-api.teslamotors.com/oauth/token" "${TMP_FILE}" "${POST_DATA}" "Content-Type:application/json" "Accept: application/json" "Authorization: Bearer ${AUTH_access_token}"
+    STATUS=$?
+    results_to_vars "AUTH_" < "${TMP_FILE}"
+    if [ ${STATUS} != 0 -o ${HTTP_CODE} != 200 -o -z "${AUTH_access_token}" ]; then
+	return 1
+    fi
+#echo "post page: HTTP code ${HTTP_CODE}, status ${STATUS}, token ${AUTH_access_token}"
+
+    tesla_save_state
+    return 0
+}
+
+#
+# tesla_vehicle()
+#
+# Select the vehicle
+#
+# Creates variables of the form:
+#   Car_Name_ID with the ID to use for accessing the car
+#   TESLA_ids[]=( "..." "..." ... )
+#   TESLA_vehicles[]=( "car name 1" "car name 2" ... )
+#   TESLA_vins[]=( "5YJXXXXXXXX123456" "5YJXXXXXXXX123457" ... )
+#
+tesla_vehicle()
+{
+    local URL="https://owner-api.teslamotors.com/api/1/vehicles"
+    false
+    load_page ${URL} ${TMP_FILE} "Authorization:Bearer ${AUTH_access_token}" || return 1
+    grep -q 'display_name' ${TMP_FILE} || return 1
+
+    TESLA_vins=()
+    TESLA_ids=()
+    TESLA_vehicles=()
+    eval $(cat ${TMP_FILE} | sed -e 's/"display_name":/\n&/g' | grep '^"display_name"' | sed -e 's/"display_name":"//' -e 's/",".*//' -e 's/.*:"//' -e 's/.*/TESLA_vehicles+=("&")/')
+    eval $(cat ${TMP_FILE} | sed -e 's/"vin":/\n&/g' | grep '^"vin"' | sed -e 's/"vin":"//' -e 's/",".*//' -e 's/.*:"//' -e 's/.*/TESLA_vins+=("&")/')
+    eval $(cat ${TMP_FILE} | sed -e 's/"id_s":/\n&/g' | grep '^"id_s"' | sed -e 's/"id_s":"//' -e 's/",".*//' -e 's/.*:"//' -e 's/.*/TESLA_ids+=("&")/')
+    eval $(cat ${TMP_FILE} | sed -e 's/"display_name":/\n&/g' | grep '^"display_name"' | sed -e 's/,.*,"id_s":"/_ID=/' -e 's/,.*//' -e 's/.*"//' -e 's/ /_/g' )
+}
+
+#
+# tesla_location
+#
+# $AUTH_access_token
+# $1 -- car index (0,1,...) (used if $2 is blank)
+# $2 -- car ID (optional)
+# $3 -- temporary file (use ${TMP_FILE} if blank)
+#
+tesla_location()
+{
+    local INDEX="$1"
+    [ -z "${INDEX}" ] && INDEX=${TESLA_SELECTED_CAR}
+    local ID="$2"
+    [ -z "${ID}" ] && ID=${TESLA_ids[INDEX]}
+    local FILE="$3"
+    [ -z "${FILE}" ] && FILE="${TMP_FILE}"
+
+    unset TESLA_latitude TESLA_longitude
+
+    local URL="https://owner-api.teslamotors.com/api/1/vehicles/${ID}/data_request/drive_state"
+    load_page ${URL} ${FILE} "Authorization:Bearer ${AUTH_access_token}" || return 1
+
+    if grep -q 'vehicle unavailable' ${FILE}; then
+	# Vehicle is offline
+	return 0
+    fi
+    eval $(cat ${FILE} | sed -e 's/.*{//' -e 's/}.*/\n/' -e 's/,/\n/g' | sed -e 's/^"//' -e 's/":/=/' -e 's/^/TESLA_/')
+}
+
+#
+# tesla_wake()
+#
+# Wake up the car
+#
+# $AUTH_access_token
+# $1 -- car index (0,1,...) (used if $2 is blank)
+# $2 -- car ID (optional)
+# $3 -- temporary file (use ${TMP_FILE} if blank)
+#
+tesla_wake()
+{
+    local ID="$2"
+    [ -z "${ID}" ] && ID=${TESLA_ids[$1]}
+    local FILE="$3"
+    [ -z "${FILE}" ] && FILE="${TMP_FILE}"
+
+    local URL="https://owner-api.teslamotors.com/api/1/vehicles/${ID}/wake_up"
+    #echo ''
+    #echo "Waking up...   "
+    #echo "${URL}"
+    #echo "${FILE}"
+    post_page "${URL}" "${FILE}" "" "Authorization:Bearer ${AUTH_access_token}" || return 1
+    if [ ! -s "${FILE}" ]; then
+	echo "Empty post result file"
+    fi
+    grep -q "state" "${FILE}" && eval $(cat "${FILE}" | sed -e 's/.*{//' -e 's/}.*/\n/' -e 's/,/\n/g' | sed -e 's/^"//' -e 's/":/=/' -e 's/^/TESLA_/' | grep TESLA_state)
+    echo Result: ${TESLA_state}
+    echo HTTP status ${HTTP_CODE}
+    # FIXME: Should we wait for the car to wake up?  Set a flag to keep polling?
+}
+
+
+#
+# lat_long_addr()
+#
+# Get a street address from the lat/long
+#
+# Cache recent hits.  If something matches to within +- 0.0001 lat or long, use the hit from the cache.
+#
+# Cache is two associative arrays with the same indices:
+#   TESLA_ADDRESS_CACHE[] -- text strings for the lat/long
+#   TESLA_ADDRESS_CACHE_TIME[] -- Unix time stamp of the last access time
+#
+# FIXME To-Do: There is currently no code to purge old entries, so the cache will grow indefinitely
+#
+# output:
+#   $LAT_LONG_ADDR
+#
+lat_long_addr()
+{
+    declare -Ag TESLA_ADDRESS_CACHE
+    declare -Ag TESLA_ADDRESS_CACHE_TIME
+    local INDEX
+
+    # Create a cache index
+    INDEX="LL${TESLA_latitude%??}_${TESLA_longitude%??}"
+    INDEX="${INDEX//./p}"
+    INDEX="${INDEX//-/m}"
+    # Look up and return the address if cached
+    if [ -n "${TESLA_ADDRESS_CACHE[${INDEX}]}" ]; then
+	LAT_LONG_ADDR="${TESLA_ADDRESS_CACHE[${INDEX}]}"
+	TESLA_ADDRESS_CACHE_TIME[${INDEX}]=$(date +%s)
+	return
+    fi
+
+    # Get the address from openstreetmap.org
+    local URL="https://nominatim.openstreetmap.org/reverse?lat=${TESLA_latitude}&lon=${TESLA_longitude}"
+    load_page "${URL}" ${TMP_FILE} || return 1
+    LAT_LONG_ADDR="$(cat ${TMP_FILE} | grep addressparts | sed -e 'sX.*<addressparts>\(.*\)</addressparts>.*X\1X' -e 'sX<county>.*</county>XX' -e 'sX<country>.*</country>XX' -e 'sX<country_code>.*</country_code>XX' -e 'sX</house_number><road>X X' -e 'sX</state><postcode>X X' -e 'sX<[^>]*><[^>]*>X, Xg' -e 's/<[^>]*>//g')"
+
+    # Save the address in the cache
+    TESLA_ADDRESS_CACHE[${INDEX}]="${LAT_LONG_ADDR}"
+    TESLA_ADDRESS_CACHE_TIME[${INDEX}]=$(date +%s)
+}
+
+#
+# rename_location()
+#
+# FIXME To-Do: Save the before and after such that the rename will impact all locations that resolve
+# to the given address.
+#
+rename_location()
+{
+    local INDEX ADDR
+
+    # Create a cache index
+    INDEX="LL${TESLA_latitude%??}_${TESLA_longitude%??}"
+    INDEX="${INDEX//./p}"
+    INDEX="${INDEX//-/m}"
+
+    restore_term
+    if [ -z "${TESLA_ADDRESS_CACHE[${INDEX}]}" ]; then
+	clear
+	echo ""
+	echo "Current address not found in the cache."
+	echo ""
+	sleep 5
+	return
+    fi
+
+    clear
+    echo ""
+    echo "Lat/Long: {TESLA_latitude},${TESLA_longitude}"
+    echo ""
+    echo "${TESLA_ADDRESS_CACHE[${INDEX}]}"
+    echo ""
+    echo "Enter new text to display for this location"
+    echo "(or enter to leave it alone)"
+    read ADDR
+    # Remove leading and trailing space
+    ADDR="${ADDR#"${ADDR%%[![:space:]]*}"}"
+    ADDR="${ADDR%"${ADDR##*[![:space:]]}"}"
+    # If no input; do nothing
+    [ -z "${ADDR}" ] && return
+
+    # Save new text
+    TESLA_ADDRESS_CACHE[${INDEX}]="${ADDR}"
+}
+
+
+#
+# time_to_dest()
+#
+# Result:
+#  $SECS Seconds to reach home
+#  $STR  String representing time and distance
+#
+time_to_dest()
+{
+    local DEST="${1// /+}"
+    [ -z "${DEST}" ] && DEST="${TESLA_home_address}"
+    unset SECS
+    unset STR
+    [ -z "${TESLA_latitude}" ] && return 1
+
+    local URL A
+    if [ -z "${DEST}" ]; then
+	echo "Enter home address"
+	echo "Example: 123 Sesame St, New York, NY 12345"
+	echo -n "Address: "
+	read A
+	TESLA_home_address="${A// /+}"
+	DEST="${TESLA_home_address}"
+    fi
+    URL="https://www.google.com/maps/dir/${TESLA_latitude},${TESLA_longitude}/${DEST}/"
+    load_page "${URL}" ${TMP_FILE} || return 1
+
+    local DIST WAIT
+    eval $(cat ${TMP_FILE} | sed -e 's/[[]/\n&/g' -e 's/[]]/&\n/g' | grep '^[[]' | grep --after-context=1 '[0-9] miles' | sed -e 's/.*"\(.*\)\\".*/\1/' -e 's/[0-9] h/&our/' -e 's/.*/"&"/' | head -n 2 | sed -e 's/^/DIST=/' -e N -e 's/\n/ WAIT=/')
+
+    SECS=$(( $(date -d "now + ${WAIT}" +%s) -  $(date +%s) ))
+    STR="${WAIT} away; ${DIST}"
+    return 0
+}
+
+#
+# tesla_status_popup()
+#
+# Assumes TESLA_latitude, etc. are set.
+# Assumes time_to_dest has been called.
+#
+# $1 -- message
+# $2 -- background color
+#
+tesla_status_popup()
+{
+    local STR2
+    # Get the address from openstreetmap.org
+    lat_long_addr
+    # Append gear/speed to status
+    case ${TESLA_shift_state} in
+	D ) STR2="; In DRIVE, ${TESLA_speed} mph" ;;
+	R ) STR2="; In REVERSE, ${TESLA_speed} mph" ;;
+	P ) STR2="; In PARK" ;;
+	null ) STR2="; Car is OFF" ;;
+    esac
+    # Pop up the notice
+    local W=${#LAT_LONG_ADDR}
+    [ ${#LAT_LONG_ADDR} -lt $(( ${#STR} + ${#STR2} )) ] && W=${#STR}
+    xterm -bg "$2" -fs 18 -geometry $((W+2))x5 -T "Tesla Alert" -e 'echo "";echo " '"$1"'";echo " '"${LAT_LONG_ADDR}"'";echo " '"${STR}${STR2}"'";read a'
+}
+
+#
+# tesla_status_display()
+#
+# Assumes TESLA_latitude, etc. are set.
+# Assumes time_to_dest has been called.
+#
+tesla_status_display()
+{
+    echo ""
+    echo "${TESLA_vehicles[TESLA_SELECTED_CAR]}"
+
+    # Get the address from openstreetmap.org
+    if [ -n "${TESLA_latitude}" ]; then
+	lat_long_addr
+	# This version cleans up junk we don't care about and displays it more nicely
+	#cat ${TMP_FILE} | grep addressparts | sed -e 'sX.*<addressparts>\(.*\)</addressparts>.*X\1X' -e 'sX<county>.*</county>XX' -e 'sX<country>.*</country>XX' -e 'sX<country_code>.*</country_code>XX' -e 'sX</house_number><road>X X' -e 'sX</state><postcode>X X' -e 'sX<[^>]*><[^>]*>X, Xg' -e 's/<[^>]*>//g' -e 's/^/  /'
+	echo "${LAT_LONG_ADDR}"
+	if [ "${STR}" == " away; " ]; then
+	    echo "  almost home"
+	else
+	    echo "  ${STR}"
+	fi
+    fi
+
+    # Display gear/speed
+    if [ "${TESLA_power}" == 0 ]; then
+	echo "  Car is ASLEEP"
+    else
+	case ${TESLA_shift_state} in
+	    D ) echo "  In DRIVE, ${TESLA_speed} mph" ;;
+	    R ) echo "  In REVERSE, ${TESLA_speed} mph" ;;
+	    P ) echo "  In PARK" ;;
+	    null ) echo "  Car is OFF" ;;
+	esac
+    fi
+}
+
+#
+# drive_alert()
+#
+# Pop up an alert when the car is in DRIVE
+#
+drive_alert()
+{
+    local DIS
+
+    tesla_login || return 1
+    tesla_vehicle || return 1
+    while true; do
+	tesla_location || return 1
+	if [ -z "${TESLA_latitude}" ]; then
+	    sleep 15
+	    continue
+	fi
+	if [ ${TESLA_shift_state} != D ]; then
+	    sleep 15
+	    continue
+	fi
+	time_to_dest
+	tesla_status_popup "Car is in DRIVE" "green"
+	break
+    done
+    return 0
+}
+
+#
+# status_alert()
+#
+# Alert if the gear changes, car switches to/from off, goes to sleep or wakes up, or
+# is within 5 mintues of home
+#
+status_alert()
+{
+    local DIS GEAR AWAKE ON
+    local TARGET=$(( 5 * 60 ))
+    local W
+
+    [ -n "$1" ] && TARGET=$(( $1 * 60 ))
+
+    tesla_login || return 1
+    tesla_vehicle || return 1
+    while true; do
+	tesla_location || return 1
+	if [ -z "${TESLA_latitude}" ]; then
+	    if [ "${AWAKE}" == yes ]; then
+		tesla_status_popup "Car is now asleep" "green"
+	    fi
+	    AWAKE=no
+	    sleep 15
+	    continue
+	fi
+	if [ "${TESLA_shift_state}" != "${GEAR}" ]; then
+	    GEAR="${TESLA_shift_state}"
+	    time_to_dest
+	    if [ "${GEAR}" == "null" ]; then
+		tesla_status_popup "Car is off" "green"
+	    else
+		tesla_status_popup "Car changed gears" "green"
+	    fi
+	    sleep 15
+	    continue
+	fi
+	if [ "${TESLA_shift_state}" != "D" ]; then
+	    sleep 15
+	    continue
+	fi
+	time_to_dest
+	if [ ${SECS} -gt ${TARGET} ]; then
+	    W=$(( ( SECS - TARGET ) / 2 ))
+	    [ ${W} -lt 30 ] && W=30
+	    sleep ${W}
+	    continue
+	fi
+	tesla_status_popup 'ALMOST HOME!!!' "red"
+	break
+    done
+    return 0
+}
+
+#
+# tesla_status()
+#
+tesla_status()
+{
+    local DIS
+
+    tesla_login || return 1
+    tesla_vehicle || return 1
+    tesla_location || return 1
+    time_to_dest
+    tesla_status_popup "Car status" "green"
+    return 0
+}
+
+#
+# tesla_monitor()
+#
+# Monitor the status of the car
+#
+tesla_monitor()
+{
+    local THEN NOW ELAPSED STATE
+
+    tesla_login || return 1
+    tesla_vehicle || return 1
+    while true; do
+	tesla_location
+	if [ "${TESLA_power}" == 0 ]; then
+	    LOC="Car is asleep"
+	    STR=""
+	    STATE=("$(date)")
+	else
+	    time_to_dest
+	    lat_long_addr
+
+	    local LOC
+	    LOC="${LAT_LONG_ADDR}"
+	    # Append gear/speed to status
+	    case ${TESLA_shift_state} in
+		D ) STATE="; In DRIVE, ${TESLA_speed} mph" ;;
+		R ) STATE="; In REVERSE, ${TESLA_speed} mph" ;;
+		P ) STATE="; In PARK" ;;
+		null ) STATE="; Car is OFF" ;;
+	    esac
+	fi
+	
+	clear
+	echo ""
+	echo " ${LOC}"
+	echo " ${STR}${STATE}"
+	THEN=$(date +%s)
+	while ! read -t 1 a; do
+	    NOW=$(date +%s)
+	    ELAPSED=$(( NOW - THEN ))
+	    echo -n "[80D[K"
+	    printf "%d:%02d" $(( ELAPSED/60 )) $(( ELAPSED % 60 ))
+	done
+    done
+
+}
+
+
+#
+# tesla_gui_select_car()
+#
+tesla_gui_select_car()
+{
+    if ! tesla_login; then
+	echo Failed to log in
+	return 1
+    fi
+    if ! tesla_vehicle; then
+	echo Failed to get list of vehicles
+	return 1
+    fi
+    tesla_save_state
+    if [ ${#TESLA_vehicles[@]} == 0 ]; then
+	echo No vehicles found
+	return 1
+    fi
+    if [ ${#TESLA_vehicles[@]} == 1 ]; then
+	TESLA_SELECTED_CAR="${TESLA_vehicles[0]}"
+	return 0
+    fi
+
+    #
+    # Multiple vehicles
+    #
+    # Print out a vehicle status summary, and then ask the user to click
+    # on the desired car.
+    #
+    unset TESLA_SELECTED_CAR
+    MAXLEN=${#TESLA_vehicles[0]}
+    for ((I=1;I<=${#TESLA_vehicles[@]};++I)); do
+	[ ${#TESLA_vehicles[I]} -gt ${MAXLEN} ] && MAXLEN=${#TESLA_vehicles[I]}
+    done
+
+    #
+    # Repeat this loop if we need to redraw the GUI due to window resizing
+    #
+    while true; do
+	clear
+	for ((I=0;I<LINES;++I)); do
+	    echo ''
+	done
+	cat ${TMP_FILE} | sed -e 's/"display_name":/\n&/g' | grep '^"display_name"' | sed -e 's/^[^:]*://' -e 's/",".*,"state"//' -e 's/",".*//' -e 's/:"/:  /' -e 's/"//'
+	echo ''
+	echo "Select a car"
+	echo ''
+	echo ''
+	echo ''
+	echo ''
+	button_init
+    	button_add "Quit" "quit" 0 -1 -1
+	for ((I=0;I<${#TESLA_vehicles[@]};++I)); do
+	    button_add "${TESLA_vehicles[I]}" $I 0 0
+	done
+	button_disp
+	button_get_click
+	if [ "${BUTTON_CLICKED}" == "quit" ]; then
+	    restore_term
+	    return 1
+	fi
+	if [ -n "${BUTTON_CLICKED}" ]; then
+	    TESLA_SELECTED_CAR="${BUTTON_CLICKED}"
+	    break
+	fi
+    done # draw GUI
+    tesla_save_state
+    return 0
+}
+
+#
+# tesla_alert_dest_task()
+#
+# $1 -- car ID
+# $2 -- temporary file
+# $3 -- car Name
+# $4 -- AUTH_access_token
+# $5 -- time (default: 5 minutes)
+# $6 -- Destination
+#
+tesla_alert_dest_task()
+{
+    local ID="$1"
+    TMP_FILE="$2"
+    local NAME="$3"
+    AUTH_access_token="$4"
+    local TARGET="$5"
+    local DEST="$6"
+
+    while true; do
+	tesla_location "" "${ID}" || return 1
+	if [ -z "${TESLA_latitude}" ]; then
+	    sleep 15
+	    continue
+	fi
+	if [ ${TESLA_shift_state} == P ]; then
+	    sleep 5
+	    continue
+	fi
+	time_to_dest "${DEST}"
+	# echo "${NAME} time to home: $((SECS/60)):$((SECS/60/10))$((SECS/60%10))"
+	if [ ${SECS} -gt ${TARGET} ]; then
+	    W=$(( ( SECS - TARGET ) / 2 ))
+	    [ ${W} -lt 30 ] && W=30
+	    sleep ${W}
+	    continue
+	fi
+	if [ "${DEST}" == "${TESLA_home_address}" ]; then
+	    tesla_status_popup "${NAME} is "'ALMOST HOME!!!' "red"
+	else
+	    tesla_status_popup "${NAME} is "'ALMOST THERE!!!' "red"
+	fi
+	break
+    done
+    return 0
+}
+
+#
+# tesla_alert_awake_task()
+#
+# $1 -- car ID
+# $2 -- temporary file
+# $3 -- car Name
+# $4 -- AUTH_access_token
+#
+tesla_alert_awake_task()
+{
+    local ID="$1"
+    TMP_FILE="$2"
+    local NAME="$3"
+    AUTH_access_token="$4"
+
+    while true; do
+	tesla_location "" "${ID}" || return 1
+	if [ -z "${TESLA_latitude}" ]; then
+	    sleep 15
+	    continue
+	fi
+	tesla_status_popup "${NAME} is AWAKE" "green"
+	break
+    done
+    return 0
+}
+
+#
+# tesla_alert_gear_task()
+#
+# $1 -- car ID
+# $2 -- temporary file
+# $3 -- car Name
+# $4 -- AUTH_access_token
+#
+tesla_alert_gear_task()
+{
+    local ID="$1"
+    TMP_FILE="$2"
+    local NAME="$3"
+    AUTH_access_token="$4"
+    local GEAR
+
+    tesla_location "" "${ID}" || return 1
+    if [ -z "${TESLA_latitude}" ]; then
+	GEAR=ASLEEP
+    else
+	GEAR=${TESLA_shift_state}
+    fi
+
+    while true; do
+	tesla_location "" "${ID}" || return 1
+	if [ -z "${TESLA_latitude}" ]; then
+	    if [ ${GEAR} != "ASLEEP" ]; then
+		tesla_status_popup "${NAME} is ASLEEP" "red"
+		break
+	    fi
+	    sleep 15
+	    continue
+	fi
+	if [ ${TESLA_shift_state} == ${GEAR} ]; then
+	    sleep 15
+	    continue
+	fi
+	tesla_status_popup "${NAME} is now in gear ${TESLA_shift_state}" "green"
+	break
+    done
+    return 0
+}
+
+#
+# tesla_alert_home()
+#
+# Alert when the car is within 5 minutes of home
+#
+tesla_alert_home()
+{
+    local TARGET=$(( 5 * 60 ))
+    tesla_alert_dest_task "${TESLA_ids[TESLA_SELECTED_CAR]}" "${TMP_FILE}.${#ALERT_PIDS[*]}" "${TESLA_vehicles[TESLA_SELECTED_CAR]}" "${AUTH_access_token}" ${TARGET} "${TESLA_home_address}" &
+    ALERT_PIDS+=( $! )
+    ALERT_CAR+=( ${TESLA_SELECTED_CAR} )
+    ALERT_TARGET+=( time:${TARGET} )
+    ALERT_DEST+=( "${TESLA_home_address}" )
+    return 0
+}
+
+#
+# tesla_alert_awake()
+#
+# Alert when the car is awake
+#
+tesla_alert_awake()
+{
+    tesla_alert_awake_task "${TESLA_ids[TESLA_SELECTED_CAR]}" "${TMP_FILE}.${#ALERT_PIDS[*]}" "${TESLA_vehicles[TESLA_SELECTED_CAR]}" "${AUTH_access_token}" &
+    ALERT_PIDS+=( $! )
+    ALERT_CAR+=( ${TESLA_SELECTED_CAR} )
+    ALERT_TARGET+=( awake )
+    ALERT_DEST+=( "" )
+    return 0
+}
+
+#
+# tesla_alert_dest()
+#
+# Alert when the car is within X minutes of [dest]
+#
+tesla_alert_dest()
+{
+    tesla_alert_dest_task "${TESLA_ids[TESLA_SELECTED_CAR]}" "${TMP_FILE}.${#ALERT_PIDS[*]}" "${TESLA_vehicles[TESLA_SELECTED_CAR]}" "${AUTH_access_token}" $(( ${TESLA_dest_minutes[$1]} * 60 )) "${TESLA_dest_addr[$1]}" &
+    ALERT_PIDS+=( $! )
+    ALERT_CAR+=( ${TESLA_SELECTED_CAR} )
+    ALERT_TARGET+=( time:$(( ${TESLA_dest_minutes[$1]} * 60 )) )
+    ALERT_DEST+=( "${TESLA_dest_addr[$1]}" )
+    return 0
+}
+
+#
+# tesla_alert_gear()
+#
+# Alert when the car changes gears
+#
+tesla_alert_gear()
+{
+    tesla_alert_gear_task "${TESLA_ids[TESLA_SELECTED_CAR]}" "${TMP_FILE}.${#ALERT_PIDS[*]}" "${TESLA_vehicles[TESLA_SELECTED_CAR]}" "${AUTH_access_token}" &
+    ALERT_PIDS+=( $! )
+    ALERT_CAR+=( ${TESLA_SELECTED_CAR} )
+    ALERT_TARGET+=( gear )
+    ALERT_DEST+=( "" )
+    return 0
+}
+
+#
+# tesla_alert_cancel()
+#
+# $1 -- index of alert to cancel (default: all)
+#
+tesla_alert_cancel()
+{
+    local START END
+    START=0
+    END=${#ALERT_PIDS[*]}
+    if [ -n "$1" ]; then
+	START="$1"
+	END=$(( $1 + 1 ))
+    fi
+    for ((I=${START};I<${END};++I)); do
+	if [ ${ALERT_PIDS[I]} -gt 0 ]; then
+	    kill -9 ${ALERT_PIDS[I]} >& /dev/null
+	fi
+    done
+    for ((I=${START};I<${END};++I)); do
+	if [ ${ALERT_PIDS[I]} -gt 0 ]; then
+	    wait ${ALERT_PIDS[I]}
+	fi
+    done
+}
+
+#
+# tesla_config_set_home()
+#
+tesla_config_set_home()
+{
+    local ADDR
+    restore_term
+    clear
+    echo "Set home address"
+    echo ""
+    if [ -n "${TESLA_home_address}" ]; then
+	echo "Current: ${TESLA_home_address//+/ }"
+    else
+	echo "Current: (none set)"
+    fi
+    echo ''
+    echo -n "New (blank for no change): "
+    read ADDR
+    # Remove leading and trailing space
+    ADDR="${ADDR#"${ADDR%%[![:space:]]*}"}"
+    ADDR="${ADDR%"${ADDR##*[![:space:]]}"}"
+    # If no input; do nothing
+    [ -z "${ADDR}" ] && return
+    #
+    # Now validate address
+    #
+    ADDR="${ADDR// /+}"
+    # FIXME: If the address isn't good, print an error and return.  How can we test?
+    TESLA_home_address="${ADDR}"
+}
+
+#
+# tesla_config_set_dest()
+#
+# Add an entry to the following arrays:
+#   TESLA_dest_addr=( "123 Example St..." )
+#   TESLA_dest_label=( "Bagel Shop" )
+#   TESLA_dest_minutes=( 15 ) # Minutes to dest
+#
+tesla_config_set_dest()
+{
+    local I O B T
+    local ADDR
+    restore_term
+    clear
+    echo "Set/modify destinations"
+    echo ""
+    echo "Current destinations:"
+    if [ ${#TESLA_dest_addr[*]} == 0 ]; then
+	echo "  (none)"
+    else
+	echo -e "#\tLabel\tAddress"
+	for ((I=0;I<${#TESLA_dest_addr[*]};++I)); do
+	    echo -e "$I\t${TESLA_dest_label[I]}\t${TESLA_dest_minutes[I]}\t${TESLA_dest_addr[I]}"
+	done
+    fi
+    echo -e "${#TESLA_dest_addr[*]}\t[Create new entry]"
+    echo ""
+    echo -n "Choice? "
+    read I
+    if ! [[ "${I}" =~ ^[0-9]*$ ]]; then
+	echo "Choice not valid; no changes made"
+	sleep 5
+	return
+    fi
+
+    if [ $I -lt ${#TESLA_dest_addr[*]} ]; then
+	echo ""
+	echo "Modify which field?"
+	echo ""
+	echo " 1)  Button label: ${TESLA_dest_label[I]}"
+	echo " 2)  Time for alert: ${TESLA_dest_minutes[I]} minutes"
+	echo " 3)  Address: ${TESLA_dest_addr[I]}"
+	echo " 4)  [Delete entire entry]"
+	echo ""
+	echo -n "Choice? "
+	read O
+	if ! [[ "${O}" =~ ^[1-4]$ ]]; then
+	    echo "Choice not valid; no changes made"
+	    sleep 5
+	    return
+	fi
+	case ${O} in
+	    1 )
+		echo -n "New button label: "
+		read B
+		[ -z "${B}" ] && return
+		TESLA_dest_label[I]="$B"
+		;;
+	    2 )
+		echo -n "Minutes for alert: "
+		read T
+		[ -z "${T}" ] && return
+		[[ "${T}" =~ ^[1-9][0-9]*$ ]] || return
+		TESLA_dest_minutes[I]="$T"
+		;;
+	    3 )
+		echo -n "Address: "
+		read ADDR
+		[ -z "${ADDR}" ] && return
+		TESLA_dest_addr[I]="${ADDR}"
+		;;
+	    4 )
+		unset TESLA_dest_label[I]
+		unset TESLA_dest_minutes[I]
+		unset TESLA_dest_addr[I]
+		TESLA_dest_label=("${TESLA_dest_label[@]}")
+		TESLA_dest_minutes=("${TESLA_dest_minutes[@]}")
+		TESLA_dest_addr=("${TESLA_dest_addr[@]}")
+	    ;;
+	esac
+	return
+    fi
+
+    echo ""
+    echo -n "New button label: "
+    read B
+    [ -z "${B}" ] && return
+    echo -n "Minutes for alert: "
+    read T
+    [ -z "${T}" ] && return
+    [[ "${T}" =~ ^[1-9][0-9]*$ ]] || return
+    echo -n "Address: "
+    read ADDR
+    [ -z "${ADDR}" ] && return
+    
+    I=${#TESLA_dest_addr[*]}
+    TESLA_dest_label[I]="${B}"
+    TESLA_dest_minutes[I]="${T}"
+    TESLA_dest_addr[I]="${ADDR}"
+}
+
+#
+# tesla_send_navigation_address()
+#
+tesla_send_navigation_address()
+{
+    local ADDR
+    restore_term
+    clear
+    echo ""
+    echo "Send address for navigation to ${TESLA_vehicles[TESLA_SELECTED_CAR]}"
+    echo ""
+    echo -n "Address (blank to skip): "
+    read ADDR
+    # Remove leading and trailing space
+    ADDR="${ADDR#"${ADDR%%[![:space:]]*}"}"
+    ADDR="${ADDR%"${ADDR##*[![:space:]]}"}"
+    # If no input; do nothing
+    [ -z "${ADDR}" ] && return
+    #
+    # Now validate address
+    #
+    ADDR="${ADDR// /+}"
+    local URL="https://owner-api.teslamotors.com/api/1/vehicles/${TESLA_ids[TESLA_SELECTED_CAR]}/command/share"
+    # FIXME: If the address isn't good, print an error and return.  How can we test?
+    TESLA_home_address="${ADDR}"
+    local POST_DATA="type=share_ext_content_raw&locale=en-US&timestamp_ms=$(date +%s)&value[android.intent.extra.TEXT]=${ADDR}\n\nhttps://goo.gl/maps/X"
+    post_page "${URL}" "${TMP_FILE}" "${POST_DATA}" "Authorization:Bearer ${AUTH_access_token}" || return 1
+    if [ ! -s "${TMP_FILE}" ]; then
+	echo "Empty post result file"
+    fi
+    if [ ${HTTP_CODE} == 200 ]; then
+	echo ""
+	echo "Address sent"
+	echo '(navigation will activate *if* it'"'"'s a valid address)'
+	sleep 5
+	return
+    fi
+    echo ''
+    echo 'Bad HTTP status!'
+    echo HTTP status ${HTTP_CODE}
+    sleep 15
+}
+
+#
+# tesla_send_message_via_browser()
+#
+# This doesn't work, and I don't know if there is a way to make it work.
+# The idea is to use a web server that will display the "msg=..." parameter
+# on the screen, and send that URL to the web browser.  Since we can
+# send to the navigation and the media streaming, there should be a way.
+#
+tesla_send_message_via_browser()
+{
+    local MSG
+    restore_term
+    clear
+    echo ""
+    echo "Send message via web page to ${TESLA_vehicles[TESLA_SELECTED_CAR]}"
+    echo ""
+    echo -n "Message (blank to skip): "
+    read MSG
+
+    # Remove leading and trailing space
+    ADDR="${ADDR#"${ADDR%%[![:space:]]*}"}"
+    ADDR="${ADDR%"${ADDR##*[![:space:]]}"}"
+    # If no input; do nothing
+    [ -z "${ADDR}" ] && return
+
+    #
+    # Now validate address
+    #
+    ADDR="${ADDR// /+}"
+    local URL="https://owner-api.teslamotors.com/api/1/vehicles/${TESLA_ids[TESLA_SELECTED_CAR]}/command/share"
+    # FIXME: If the address isn't good, print an error and return.  How can we test?
+    TESLA_home_address="${ADDR}"
+    local POST_DATA="type=share_ext_content_raw&locale=en-US&timestamp_ms=$(date +%s)&value[android.intent.extra.TEXT]=\n\nhttps://www.example.com/msg.php?msg=$(echo "${MSG}" | percent_encode)"
+    post_page "${URL}" "${TMP_FILE}" "${POST_DATA}" "Authorization:Bearer ${AUTH_access_token}" || return 1
+    if [ ! -s "${TMP_FILE}" ]; then
+	echo "Empty post result file"
+    fi
+    if [ ${HTTP_CODE} == 200 ]; then
+	echo ""
+	echo "Message sent"
+	sleep 5
+	return
+    fi
+    echo ''
+    echo 'Bad HTTP status!'
+    echo HTTP status ${HTTP_CODE}
+    sleep 15
+}
+
+
+#
+# tesla_gui_select_alert()
+#
+# Select an alert to watch for status changes on a car
+#
+tesla_gui_select_alert()
+{
+    local COUNT I
+
+    while true; do
+	button_init
+	button_add "Refresh" "refresh" 0 0
+	button_add "Cancel All" "cancel" 0 0
+	button_add "Gear Change" "gear" 0 0
+	button_add "Awake" "awake" 0 0
+	button_add "Set Home" "sethome" 0 1
+	button_add "Set Dest" "setdest" 0 1
+	[ -n "${TESLA_home_address}" ] && button_add "Home 5 Min" "home" 0 1
+	button_add "Quit" "quit" 0 -1 -1
+	button_add "Main Menu" "main" 0 -1 -1
+	for ((I=0;I<${#TESLA_dest_addr[*]};++I)); do
+	    button_add "${TESLA_dest_label[I]}" "dest_$I" 0 $(( (I+3)/4 + 1 ))
+	done
+	clear
+	echo ''
+	echo 'Alerts:'
+	COUNT=0
+	for ((I=0;I<${#ALERT_PIDS[*]};++I)); do
+	    if [ ${ALERT_PIDS[I]} -gt 0 ]; then
+		if ! kill -0 ${ALERT_PIDS[I]} >& /dev/null; then
+		    wait ${ALERT_PIDS[I]}
+		    ALERT_PIDS[I]=0
+		fi
+	    fi
+	    if [ ${ALERT_PIDS[I]} -gt 0 ]; then
+		if [ -n "${ALERT_DEST[I]}" ]; then
+		    echo "  ${TESLA_vehicles[${ALERT_CAR[I]}]}: ${ALERT_TARGET[I]} to ${ALERT_DEST[I]//+/ }"
+		else
+		    echo "  ${TESLA_vehicles[${ALERT_CAR[I]}]}: ${ALERT_TARGET[I]}"
+		fi
+		COUNT=$(( COUNT + 1 ))
+	    fi
+	done
+	if [ ${COUNT} == 0 ]; then
+	    echo "  (none)"
+	    unset ALERT_PIDS ALERT_CAR ALERT_TARGET ALERT_DEST
+	fi
+	echo ''
+	echo "Home address:"
+	if [ -n "${TESLA_home_address}" ]; then
+	    echo "  ${TESLA_home_address//+/ }"
+	else
+	    echo "  (none set)"
+	fi
+
+	button_disp
+	button_get_click
+	
+	case "${BUTTON_CLICKED}" in
+	    quit ) return 1 ;;
+	    main ) return 0 ;;
+	    awake ) tesla_alert_awake ;;
+	    home ) tesla_alert_home ;;
+	    cancel ) tesla_alert_cancel ;;
+	    gear ) tesla_alert_gear ;;
+	    sethome ) tesla_config_set_home ;;
+	    setdest ) tesla_config_set_dest ;;
+	    dest_* ) tesla_alert_dest ${BUTTON_CLICKED#dest_} ;;
+	    refresh ) ;;
+	esac
+	tesla_save_state
+    done
+}
+
+#
+# tesla_do_command()
+#
+# Do a command
+#
+#  $1 -- API command name, plus any URL options
+#  $... -- Options
+#
+# Options:
+#  lat        -- send current latitude/longitude
+#  pin        -- send a 4-digit pin (ask if none set)
+#  pw         -- send password; ask if not saved
+#  on=...     -- on or off for valet mode (passed as-is)
+#  state=...  -- state for sunroof (passed as-is)
+#
+tesla_do_command()
+{
+    local URL
+    local POST_DATA
+    local P
+
+    URL="https://owner-api.teslamotors.com/api/1/vehicles/${TESLA_ids[TESLA_SELECTED_CAR]}/command/$1"
+    shift
+    while [ -n "$1" ]; do
+	case "$1" in
+	    lat ) POST_DATA+="&lat=${TESLA_latitude}&lon=${TESLA_longitude}" ;;
+	    pin )
+		if [ -z "${TESLA_pin}" ]; then
+		    echo -n "Set 4-digit PIN: "
+		    read P
+		    if ! [[ "$P" =~ ^[0-9][0-9][0-9][0-9]$ ]]; then
+			echo "Sorry, the PIN must be 4 digits."
+			sleep 5
+			return 1
+		    fi
+		    TESLA_pin=$P
+		fi
+		POST_DATA+="&password=${TESLA_pin}"
+		;;
+	    pw )
+		if [ -n "${TESLA_password}" ]; then
+		    P="${TESLA_password}"
+		else
+		    echo -n "Command requires password: "
+		    read P
+		    [ -z "$P" ] && return 1
+		fi
+		# FIXME: Test if this works as post data instead of URL encoding; may not matter
+		#if [[ "${URL}" =~ ? ]]; then
+		#    URL+="&password=${P}" 
+		#else
+		#    URL+="?password=${P}"
+		#fi
+		POST_DATA+="&password=$( echo "${P}" | percent_encode )"
+		;;
+	    *=* ) POST_DATA+="&$1" ;;
+	esac
+	shift
+    done
+    POST_DATA="${POST_DATA#&}"
+    post_page "${URL}" "${TMP_FILE}" "${POST_DATA}" "Authorization:Bearer ${AUTH_access_token}" || return 1
+    if [ ! -s "${TMP_FILE}" ]; then
+	echo "Empty post result file"
+	sleep 5
+    fi
+    if [ ${HTTP_CODE} == 200 ]; then
+	return
+    fi
+    echo ''
+    echo 'Bad HTTP status!'
+    echo HTTP status ${HTTP_CODE}
+    sleep 5
+}
+
+#
+# tesla_gui_controls()
+#
+tesla_gui_controls()
+{
+    while true; do
+	clear
+	echo "Controls for: ${TESLA_vehicles[TESLA_SELECTED_CAR]}"
+	button_init
+	#
+	# Possible options are:
+	#   remote_start_drive password=${TESLA_password}
+	#   trigger_homelink   lat=${TESLA_latitude}&lon=${TESLA_longitude}
+	#   speed_limit_set_limit/speed_limit_activate/speed_limit_deactivate/speed_limit_clear_pin
+	#   set_valet_mode/reset_valet_pin
+	#   set_sentry_mode    on=true/false
+	#   door_unlock/door_lock
+	#   actuate_trunk      which_trunk=rear/front
+	#   window_control     command=vent/close,lat/lon
+	#   sun_roof_control   state=vent/close
+	#   charge_port_door_open/charge_port_door_close
+	#   charge_start/charge_stop
+	#   charge_standard [set to 90%]
+	#   charge_max_range [set to 100%]
+	#   set_charge_limit   percent=[0-100]
+	#   auto_conditioning_start/auto_conditioning_stop
+	#   set_temps          driver_temp=23.4&passenger_temp=23.4 [all temps in C]
+	#   set_preconditioning_max  on=true/false  [toggle Max Defrost]
+	#   remote_seat_heater_request  heater=[0-5]&level=[0-3]
+	#   remote_steering_wheel_heater_request  on=true/false
+	#   media_...
+	#   share [may send video link somehow]
+	#   schedule_software_update/cancel_software_update
+	#
+	button_add "Garage" "garage" 0 0
+	button_add "Unlock" "unlock" 0 0
+	button_add "Close Windows" "close" 0 0
+	button_add "Vent Roof" "vent" 0 0
+
+	button_add "Quit" "quit" 0 -1 -1
+	button_add "Main Menu" "main" 0 -1 -1
+	button_disp
+	button_get_click
+	case "${BUTTON_CLICKED}" in
+	    quit ) return 1 ;;
+	    main ) return 0 ;;
+	    remote_start ) tesla_do_command remote_start pw ;;
+	    garage ) tesla_do_command trigger_homelink lat
+		     if grep -q 'result.*:false' "${TMP_FILE}"; then
+			 echo ""
+			 echo "Failed: $(grep "reason" "${TMP_FILE}" | sed -e 's/.*reason[^a-z]*"//' -e 's/".*//')"
+			 # FIXME: If charging cable is attached, that's the reason
+			 sleep 5
+		     fi
+		     ;;
+	    unlock ) tesla_do_command door_unlock ;;
+	    close ) tesla_do_command window_control lat command=close
+		    tesla_do_command sun_roof_control state=close
+		    ;;
+	    vent )  tesla_do_command sun_roof_control state=vent
+		    ;;
+	    *)
+		false;;
+	esac
+    done
+}
+
+#
+# tesla_gui_select_option()
+#
+# Show the location and time to home for the selected car.
+#
+# Show a menu with options:
+#    Refresh
+#    Wakeup (if asleep)
+#    Map [load location in Google Maps]
+#    Status
+#    Set Home
+#    Alert Near Home
+#    Select Car
+#
+tesla_gui_select_option()
+{
+    while true; do
+	if [ -z "${TESLA_SELECTED_CAR}" ]; then
+	    tesla_gui_select_car
+	    [ -z "${TESLA_SELECTED_CAR}" ] && break
+	    continue
+	fi
+	#
+	# Get and display status for the given car
+	#
+	clear
+	echo "Getting data for ${TESLA_vehicles[TESLA_SELECTED_CAR]}"
+	tesla_location "${TESLA_SELECTED_CAR}"
+	time_to_dest
+	clear
+	echo ''
+	tesla_status_display
+
+	#
+	# Buttons for options
+	#
+	button_init
+	button_add "Refresh" "refresh" 0 0
+	button_add "Details" "status" 0 0
+	button_add "Alert" "alert" 0 0
+	button_add "Switch Car" "car" 0 0
+	button_add "Map" "map" 10 1
+	button_add "Send Nav" "navigation" 0 1
+	button_add "Controls" "controls" 0 1
+	button_add "Wake Up" "wake" 0 1
+	[ -n "${TESLA_latitude}" ] && button_add "Rename addr" "rename" 0 2
+	[ -n "${TESLA_latitude}" ] && button_add "Set location as Home" "set_home" 0 2
+	# button_add "Send Message" "msg" 0 3 # Doesn't work
+	button_add "Quit" "quit" 0 -1 -1
+	button_add "Settings" "settings" 0 -1 -1
+	button_disp
+	button_get_click
+
+	case "${BUTTON_CLICKED}" in
+	    status )
+		echo "Detailed status report not yet implemented"
+		;;
+	    alert ) tesla_gui_select_alert || return 1 ;;
+	    settings )
+		echo "Settings (home address, browser, etc.) not yet implemented"
+		;;
+	    car ) tesla_gui_select_car || return 1 ;;
+	    map )
+		# FIXME: Add support for specifying the browser
+		# Hard-coded zoom level (17z), but with the marker there, it's easy to adjust
+		chromium "https://www.google.com/maps/place/${TESLA_latitude},${TESLA_longitude}/@${TESLA_latitude},${TESLA_longitude},17z"
+		;;
+	    navigation ) tesla_send_navigation_address ;;
+	    controls ) tesla_gui_controls || return 1 ;;
+	    wake ) tesla_wake ${TESLA_SELECTED_CAR} ;;
+	    rename ) rename_location ;;
+	    set_home )
+		TESLA_home_address="${LAT_LONG_ADDR}"
+		TESLA_home_address="${TESLA_latitude},${TESLA_longitude}"
+		# FIXME: Need to save lat/long to compare to see if home (not just almost)
+		# FIXME: Consider using lat/long in Google Maps directions instead of addr
+		sleep 5
+		;;
+	    msg ) tesla_send_message_via_browser ;;
+	    quit )
+		restore_term
+		return 0
+		;;
+	    refresh|* ) ;;
+	esac
+	tesla_save_state
+    done
+    # Not reached
+}
+
+#
+# tesla_gui()
+#
+# Main start
+#
+tesla_gui()
+{
+    unset TESLA_SELECTED_CAR
+    tesla_gui_select_option
+    restore_term
+}
+
+#
+# BUTTONS
+#
+# These are defined as a set of arrays:
+#   BUTTON_TEXT=(...)
+#   BUTTON_NAME=(...)
+#   BUTTON_WIDTH=(...)
+#   BUTTON_POS=(...)
+#   BUTTON_HORIZ=(...)
+#   BUTTON_COUNT
+#
+
+#
+# button_init()
+#
+# Clears and initializes all buttons
+#
+button_init()
+{
+    BUTTON_COUNT=0
+    BUTTON_TEXT=()
+    BUTTON_NAME=()
+    BUTTON_WIDTH=()
+    BUTTON_POS=()
+    BUTTON_HORIZ=()
+}
+
+
+#
+# button_add()
+#
+# Create a button on the screen.
+#
+# $1 - text in the button
+# $2 - short name (returned when clicked)
+# $3 - width (default is length of $1; 0 means equal for all buttons on row; text will be centered)
+# $4 - Rows from bottom (default: 0; -1 is top of window)
+# $5 - Min left position (default: 0; -1 says put to the right)
+#
+button_add()
+{
+    BUTTON_TEXT[BUTTON_COUNT]="$1"
+    BUTTON_NAME[BUTTON_COUNT]="$2"
+    BUTTON_WIDTH[BUTTON_COUNT]="$3"
+    [ -z "$3" ] && BUTTON_WIDTH[BUTTON_COUNT]=1
+    BUTTON_POS[BUTTON_COUNT]="$4"
+    [ -z "$4" ] && BUTTON_POS[BUTTON_COUNT]=0
+    BUTTON_HORIZ[BUTTON_COUNT]="$5"
+    [ -z "$5" ] && BUTTON_HORIZ[BUTTON_COUNT]=0
+    BUTTON_COUNT=$((BUTTON_COUNT+1))
+}
+
+#
+# button_disp()
+#
+# Display the defined buttons
+# FIXME: Does not verify that the buttons fit if the window is small
+#
+button_disp()
+{
+    BUTTON_POS_BOTTOM=() # 0 for bottom row
+    BUTTON_POS_LEFT=() # Starting left char
+    BUTTON_POS_RIGHT=() # chars to the right that this button extends
+    BUTTON_CUR_LINES=$LINES
+    BUTTON_CUR_COLUMNS=$COLUMNS
+
+    # Set base position for each botton
+    for ((I=0;I<BUTTON_COUNT;++I)); do
+	if [ ${BUTTON_POS[I]} -lt 0 ]; then
+	    # -1 => 3 ; -2 => 6
+	    BUTTON_POS_BOTTOM[I]=$(( -3 * ${BUTTON_POS[I]} - 1 ))
+	else
+	    # 0 => LINES-1; 1 => LINES-4
+	    BUTTON_POS_BOTTOM[I]=$(( LINES - ( ${BUTTON_POS[I]} * 3 ) - 1 ))
+	fi
+	# If the screen is too small, try to fix it
+	if [ ${BUTTON_POS_BOTTOM[I]} -le 0 ]; then
+	    echo -ne "\e[8;$((LINES + 1 - ${BUTTON_POS_BOTTOM[I]}));${COLUMNS}t"
+	    sleep .1
+	fi
+	BUTTON_POS_LEFT[I]=0 # Will patch this up later
+	BUTTON_POS_RIGHT[I]=${#BUTTON_TEXT[I]} # Minimum text width (need to add 4 later for spaces and lines)
+	[ ${BUTTON_WIDTH[I]} -gt ${BUTTON_POS_RIGHT[I]} ] && BUTTON_POS_RIGHT[I]=${BUTTON_WIDTH[I]}
+	BUTTON_POS_RIGHT[I]=$(( ${BUTTON_POS_RIGHT[I]} + 4 ))
+    done
+
+    # Adjust width and left start for each button
+    for ((L=$((LINES-1));L>=2;--L)); do
+	LEFT=0
+	RIGHT=0
+	MAX=0
+	for ((I=0;I<BUTTON_COUNT;++I)); do
+	    if [ ${BUTTON_POS_BOTTOM[I]} == $L ]; then
+		[ ${BUTTON_POS_RIGHT[I]} -gt ${MAX} ] && MAX=${BUTTON_POS_RIGHT[I]}
+	    fi
+	done
+	# If we have buttons starting on this line, set left boundary
+	if [ ${MAX} -gt 0 ]; then
+	    for ((I=0;I<BUTTON_COUNT;++I)); do
+		if [ ${BUTTON_POS_BOTTOM[I]} == $L ]; then
+		    # Set width to max if requested
+		    [ ${BUTTON_WIDTH[I]} -eq 0 ] && BUTTON_POS_RIGHT[I]=${MAX}
+		    BUTTON_POS_LEFT[I]=${LEFT}
+		    if [ ${BUTTON_POS_LEFT[I]} -lt ${BUTTON_HORIZ[I]} ]; then
+			BUTTON_POS_LEFT[I]=${BUTTON_HORIZ[I]}
+		    fi
+		    if [ ${BUTTON_HORIZ[I]} == "-1" ]; then
+			BUTTON_POS_LEFT[I]=$(( COLUMNS - ${BUTTON_POS_RIGHT[I]} - RIGHT ))
+			RIGHT=$(( RIGHT + ${BUTTON_POS_RIGHT[I]} + 2 ))
+			continue
+		    fi
+		    LEFT=$(( LEFT + ${BUTTON_POS_RIGHT[I]} + 2 ))
+		fi
+	    done
+	fi
+	# If the screen is too small, try to fix it
+	if [ $(( LEFT + RIGHT - 2 )) -gt ${COLUMNS} ]; then
+	    echo -ne "\e[8;${LINES};$(( LEFT + RIGHT - 2 ))t"
+	    sleep .1
+	fi
+    done
+
+    # Draw each button; order doesn't really matter
+    unset HORIZ
+    for ((I=0;I<COLUMNS;++I)); do
+	HORIZ+="q"
+    done
+
+    for ((I=0;I<BUTTON_COUNT;++I)); do
+	# Move cursor to
+	#   Line: ${BUTTON_POS_BOTTOM[I]}-2
+	#   Column: ${BUTTON_POS_LEFT[I]}
+	#   But ANSI coordinates are 1-based
+	# Print top line
+	echo -ne "\e[$((${BUTTON_POS_BOTTOM[I]}-1));$((${BUTTON_POS_LEFT[I]}+1))H"
+	echo -ne "\e(0"
+	printf "l%.*sk" $(( ${BUTTON_POS_RIGHT[I]} - 2 )) ${HORIZ}
+	echo -ne "\e(B"
+	# Print middle line
+	echo -ne "\e[$((${BUTTON_POS_BOTTOM[I]}-0));$((${BUTTON_POS_LEFT[I]}+1))H"
+	echo -ne "\e(0x\e(B"
+	C=$(( ( ${BUTTON_POS_RIGHT[I]} - 2 - ${#BUTTON_TEXT[I]} ) / 2 ))
+	printf "%*.*s" ${C} ${C} ' '
+	echo -n "${BUTTON_TEXT[I]}"
+	C=$(( ${BUTTON_POS_RIGHT[I]} - 2 - ${#BUTTON_TEXT[I]} - C ))
+	printf "%*.*s" ${C} ${C} ' '
+	echo -ne "\e(0x\e(B"
+	# Print bottom line
+	echo -ne "\e[$((${BUTTON_POS_BOTTOM[I]}+1));$((${BUTTON_POS_LEFT[I]}+1))H"
+	echo -ne "\e(0"
+	printf "m%.*sj" $(( ${BUTTON_POS_RIGHT[I]} - 2 )) ${HORIZ}
+	echo -ne "\e(B"
+    done
+}
+
+
+#
+# button_get_click()
+#
+# Wait for a button to be clicked.
+# Set BUTTON_CLICKED to the short name
+#
+# $1 - optional time limit in seconds
+#
+# Returns success on a click, error on a timeout or window resize
+#
+button_get_click()
+{
+    # local C CLICK B X Y INPUT I
+    unset BUTTON_CLICKED
+    unset BUTTON_NUMBER
+
+    #trap restore_term SIGINT
+
+    # Special terminal settings
+    echo -ne '\e[?25l' # disable cursor
+    echo -ne "\e[?9h" # Enable mouse click capture
+
+    # Wait for escape sequence (click) or resize
+    X=0
+    Y=0
+    while true; do
+	#
+	# Watch for window resize
+	#
+	[ ${BUTTON_CUR_COLUMNS} -ne ${COLUMNS} -o ${BUTTON_CUR_LINES} -ne ${LINES} ] && break # redraw screen on resize
+
+	#
+	# Read input
+	#
+	read -s -N 1 -t .5 C
+	X=$?
+	[ $X -gt 128 ] && continue # input timeout
+	[ $X -gt 0 ] && break # input error other than timeout
+	INPUT+="$C"
+
+	# Pull in any additional characters that are already ready
+	# Must use '-r' to treat backslash as a regular character; otherwise offset of 59 fails
+	while read -r -N 1 -t 0; do
+	    read -r -s -N 1 -t .1 C
+	    INPUT+="$C"
+	done
+
+	#
+	# Parse input
+	#
+
+	# Is it a mouse click?
+	if [ "${INPUT:0:3}" == "$(printf "\e[M")" -a ${#INPUT} -ge 6 ]; then
+	    CLICK="${INPUT:0:6}"
+	    INPUT="${INPUT:6}"
+	    B=${CLICK:3:1}
+	    X=${CLICK:4:1}
+	    Y=${CLICK:5:1}
+	    # convert ASCII to number
+	    eval $(printf "B=%d X=%d Y=%d" "'$B" "'$X" "'$Y")
+	    B=$(( B-32 )) # normally 0 for mouse button zero
+	    X=$(( X-33 )) # Normally -32, but that's 1-based coordinates, so subtract one more for 0-based
+	    Y=$(( Y-33 ))
+	    # DEBUG: echo '';echo "Click: Button $B $X $Y"
+	    for ((I=0;I<BUTTON_COUNT;++I)); do
+		[ $X -lt ${BUTTON_POS_LEFT[I]} ] && continue
+		[ $X -gt $(( ${BUTTON_POS_LEFT[I]} + ${BUTTON_POS_RIGHT[I]})) ] && continue
+		[ $Y -gt ${BUTTON_POS_BOTTOM[I]} ] && continue
+		[ $Y -lt $(( ${BUTTON_POS_BOTTOM[I]} -2 )) ] && continue
+		BUTTON_NUMBER=$B
+		BUTTON_CLICKED="${BUTTON_NAME[I]}"
+		if false; then
+		    echo -ne "\e[10;0H"
+		    echo -n "Click:  ${BUTTON_CLICKED} $X,$Y   ${BUTTON_POS_LEFT[I]}--$(( ${BUTTON_POS_LEFT[I]} + ${BUTTON_POS_RIGHT[I]})),$(( ${BUTTON_POS_BOTTOM[I]} -2 ))--${BUTTON_POS_BOTTOM[I]}    "
+		    sleep 2
+		fi
+	    
+		# DEBUG:	echo '';echo "Click button: $B $X $Y ${BUTTON_NAME}"
+		return 0
+	    done
+	    if false; then
+		echo -ne "\e[10;0H"
+		echo -n "Click outside button: $X,$Y      "
+		if [ ${Y} -lt 0 ]; then
+		    echo -n "Y: ${CLICK:5:1}"
+		else
+		    echo -n "            "
+		fi
+		sleep 1
+	    fi
+	    # Done with this click; skip over it in the input
+	    INPUT="${INPUT:6}"
+	else
+	    # This input is garbage; scrap the first character and try again
+	    INPUT="${INPUT:1}"
+	fi
+
+	# FIXME: Implement using arrow keys and "Enter" to highlight and select buttons
+
+    done
+
+    # Restore terminal settings
+    echo -ne "\e[?9l" # Disable mouse capture
+    echo -ne '\e[?25h' # enable cursor
+    #trap - SIGINT
+
+    return 1
+}
+
+#
+# restore_term()
+#
+# Move cursor to the bottom with clean terminal settings
+#
+restore_term()
+{
+    # Restore terminal settings
+    echo -ne "\e[?9l" # Disable mouse capture
+    echo -ne '\e[?25h' # enable cursor
+    echo -ne "\e(B" # Standard (North American) character set
+    # Move Cursor
+    echo -ne "\e[${LINES};0H"
+    echo ''
+}
+
+#
+# Launch the GUI
+#
+[ -z "${DO_NOT_RUN}" ] && tesla_gui
